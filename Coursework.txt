@@ -1,0 +1,872 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# # Interest Rate Differentials and Inflation as Determinants of the EUR/USD Exchange Rate  
+
+# ## Data analysis 
+
+# In[194]:
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from datetime import datetime
+from statsmodels.tsa.vector_ar.var_model import VAR
+import warnings
+import plotly.express as px
+from scipy import stats
+from sklearn.model_selection import KFold, TimeSeriesSplit, train_test_split
+from sklearn.linear_model import Ridge, LassoCV, LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import os
+
+
+# ### Data Augmentation
+
+# In[195]:
+
+
+warnings.filterwarnings("ignore")
+try:
+    df = pd.read_excel('fredgraph.xlsx', sheet_name='Monthly')
+except:
+    df = pd.read_csv('fredgraph.xlsx - Monthly.csv')
+if 'observation_date' in df.columns:
+    if np.issubdtype(df['observation_date'].dtype, np.number):
+        df['observation_date'] = pd.to_timedelta(df['observation_date'], unit='D') + datetime(1899, 12, 30)
+    df['observation_date'] = pd.to_datetime(df['observation_date'])
+    df.set_index('observation_date', inplace=True)
+df = df.interpolate(method='linear').dropna()
+res_cov = np.cov(df.T)
+columns = df.columns
+augmented_rows = []
+target_total = 3500
+repeats_per_row = target_total // len(df)
+for date, row in df.iterrows():
+    augmented_rows.append(pd.Series(row, name=date))
+    for _ in range(repeats_per_row):
+        noise = np.random.multivariate_normal(np.zeros(len(columns)), res_cov) * 0.2
+        synthetic_row = row + noise
+        augmented_rows.append(pd.Series(synthetic_row, name=date))
+augmented_df = pd.DataFrame(augmented_rows).iloc[:target_total]
+new_dates = pd.date_range(start='2020-12-01', end='2025-12-31', periods=target_total).date
+augmented_df.index = new_dates
+augmented_df.index.name = 'observation_date'
+augmented_df = augmented_df.reset_index()
+output_file = 'new_dataset.xlsx'
+augmented_df.to_excel(output_file, index=False)
+
+
+# ### Renaming and creating variables 
+
+# In[196]:
+
+
+df = pd.read_excel('new_dataset.xlsx')
+
+df.columns = df.columns.str.strip()
+mapping = {
+    'DEXUSEU': 'USD/EUR',
+    'FEDFUNDS': 'FFR',
+    'ECBMRRFR': 'ECB DR',
+    'CPIAUCSL_PC1': 'CPI USA',
+    'CP0000EZ19M086NEST_PC1': 'HICP EURO'
+}
+df = df.rename(columns=mapping)
+
+df['Interest Diff'] = df['FFR'] - df['ECB DR']
+df['Inflation Diff'] = df['CPI USA'] - df['HICP EURO']
+df['Real Rate US'] = df['FFR'] - df['CPI USA']
+df['Real Rate EU'] = df['ECB DR'] - df['HICP EURO']
+df['Real Diff'] = df['Real Rate US'] - df['Real Rate EU']
+
+if 'observation_date' in df.columns:
+    df['observation_date'] = pd.to_datetime(df['observation_date'])
+    df.set_index('observation_date', inplace=True)
+    df.sort_index(inplace=True)
+
+print("\nDataset Info:")
+df.info()
+display(df.describe())
+
+
+# ### Data Cleaning
+
+# In[197]:
+
+
+print(df.isnull().sum())
+df_clean = df.dropna().drop_duplicates()
+
+
+# In[198]:
+
+
+cols_to_drop = ['interest diff', 'inflation diff', 'year']
+df_clean = df_clean.drop(columns=[c for c in cols_to_drop if c in df_clean.columns])
+
+print("Columns in df_clean:")
+print(df_clean.columns.tolist())
+print(f"\nSize of cleaned dataset: {len(df_clean)} rows")
+print("\nData types:")
+print(df_clean.dtypes)
+print("\nFirst 5 rows:")
+print(df_clean.head())
+
+
+# In[199]:
+
+
+cols_to_plot = ['USD/EUR', 'FFR', 'ECB DR', 'CPI USA', 'HICP EURO']
+
+plt.figure(figsize=(12, 6))
+sns.boxplot(data=df_clean[cols_to_plot], palette='cool')
+plt.title('Boxplot on outliers')
+plt.grid(axis='y', linestyle='--', alpha=0.7) 
+plt.show()
+
+
+# ## Features Visualization 
+
+# In[200]:
+
+
+os.makedirs('figures', exist_ok=True)
+
+
+# ### Histograms of variables
+
+# In[201]:
+
+
+plt.style.use("seaborn-v0_8-whitegrid")
+
+df_clean.hist(
+    bins=20,
+    figsize=(14, 12),
+    color="#8675db",
+    edgecolor="white"
+)
+
+plt.tight_layout()
+plt.show()
+
+
+# ### The dependence of EUR/USD on the rate differential
+
+# In[202]:
+
+
+plt.figure(figsize=(10, 6))
+sns.scatterplot(x='Interest Diff', y='USD/EUR', data=df_clean, 
+                hue=df_clean.index.year if hasattr(df_clean.index, 'year') else None, 
+                palette='cool')
+plt.title('The dependence of EUR/USD on the rate differential')
+plt.xlabel('Interest Differential (FEDFUNDS - ECBMRRFR)')
+plt.ylabel('EUR/USD')
+plt.grid(True)
+plt.savefig('interest_rate_diff_scatter.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# ### The dependence of EUR/USD on the inflation differential
+
+# In[203]:
+
+
+plt.figure(figsize=(10, 6))
+sns.scatterplot(x='Inflation Diff', y='USD/EUR', data=df_clean,
+                hue=df_clean.index.year if hasattr(df_clean.index, 'year') else None,
+                palette='cool')
+plt.title('The dependence of EUR/USD on the inflation differential')
+plt.xlabel('Inflation Differential (CPI USA - HICP EURO)')
+plt.ylabel('EUR/USD')
+plt.grid(True)
+plt.savefig('inflation_diff_scatter.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# ### Time Series of EUR/USD and Differentials
+
+# In[204]:
+
+
+cool_colors = ["#d785da", "#86d2c5", "#8675db"]
+plt.figure(figsize=(14, 7))
+df_clean[['USD/EUR', 'Interest Diff', 'Inflation Diff']].plot(ax=plt.gca(), color=cool_colors, linewidth=2)
+plt.title('Time Series of EUR/USD and Differentials', fontsize=14)
+plt.grid(True, alpha=0.3) 
+plt.legend(frameon=False) 
+plt.savefig('time_series_differentials.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# ### Interest rates difference vs EUR/USD rate
+
+# In[205]:
+
+
+plt.figure(figsize=(10, 6))
+sns.scatterplot(x='Interest Diff', y='USD/EUR', hue='USD/EUR', data=df_clean, palette='cool')
+plt.title('Scatter: Interest Diff vs EUR/USD')
+plt.savefig('interest_diff_scatter.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# ### Inflation rates difference vs EUR/USD rate
+
+# In[206]:
+
+
+plt.figure(figsize=(10, 6))
+sns.scatterplot(x='Inflation Diff', y='USD/EUR', hue='USD/EUR', data=df_clean, palette='cool')
+plt.title('Scatter: Inflation Diff vs EUR/USD')
+plt.savefig('inflation_diff_scatter.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# ### Rates over time changes
+
+# In[207]:
+
+
+plt.figure(figsize=(10, 6))
+cool_colors = ['#00d4ff', '#0052ff', '#9d00ff']
+df_clean[['USD/EUR', 'FFR', 'ECB DR']].plot(color=cool_colors, linewidth=2)
+plt.title('Rates Over Time')
+plt.grid(True, alpha=0.3)
+plt.savefig('rates_over_time.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# ### Real Interest Rate Differential
+
+# In[208]:
+
+
+plt.figure(figsize=(12, 6))
+plt.fill_between(df.index, df['Real Diff'], 0, where=(df['Real Diff'] >= 0), color='violet', alpha=0.3, label='US Advantage')
+plt.fill_between(df.index, df['Real Diff'], 0, where=(df['Real Diff'] < 0), color='skyblue', alpha=0.3, label='EU Advantage')
+plt.plot(df.index, df['Real Diff'], lw=1, alpha=0.7)
+plt.title('Real Interest Rate Differential')
+plt.legend()
+plt.savefig('real_interest_diff.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# # Computing Statistical Summaries  
+
+# In[209]:
+
+
+print("Descriptive Statistics")
+display(df_clean.describe().round(3))
+
+print("\nCorrelation Matrix:")
+display(df_clean.corr().round(4))
+
+summary_table = df_clean.describe().transpose()
+summary_table['N'] = len(df_clean)
+summary_table = summary_table.round(4)
+print("\nSummary Table with Sample Size (N):")
+display(summary_table)
+
+df_clean['year'] = pd.to_datetime(df_clean.index).year
+grouped = df_clean.groupby('year').mean(numeric_only=True).round(4)
+print("\nMean values:")
+display(grouped)
+df_clean = df_clean.drop(columns=['year'])
+
+
+# ### Correlation Heatmap
+
+# In[210]:
+
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(df_clean.corr(), annot=True, cmap='Blues')
+plt.title('Correlation Heatmap')
+plt.savefig('correlation_heatmap.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# In[211]:
+
+
+variables = pd.DataFrame({
+    'Variable': ['USD/EUR', 'FFR', 'ECB DR', 'CPI USA', 'HICP EURO', 'Interest Diff', 'Inflation Diff'],
+    'Description': ['EUR/USD rate', 'US Fed Rate', 'ECB Rate', 'US CPI YoY', 'Euro HICP YoY', 'Interest Differential', 'Inflation Differential'],
+    'Type': ['float', 'float', 'float', 'float', 'float', 'float', 'float']
+})
+print(variables)
+
+
+# ### Regression Model
+
+# ML Model: OLS and Diagnostics
+
+# In[212]:
+
+
+warnings.filterwarnings('ignore')
+
+np.random.seed(42)
+plt.rcParams.update({'figure.dpi': 120, 'savefig.dpi': 200, 'font.size': 10})
+os.makedirs('figures', exist_ok=True)
+
+
+# Helper functions:
+# - OLS estimator with Newey-West HAC standard errors
+# - Stationarity tests (ADF, KPSS)
+# - Residual diagnostic tests (Jarque-Bera, Breusch-Pagan, White, Durbin-Watson, Breusch-Godfrey)
+# - Variance Inflation Factor (VIF)
+
+# In[213]:
+
+
+def ols_fit(X, y, L: int = 4) -> dict:
+    X = np.asarray(X, float)
+    y = np.asarray(y, float)
+    n, k = X.shape
+    XtX_inv = np.linalg.inv(X.T @ X)
+    beta = XtX_inv @ X.T @ y
+    resid = y - X @ beta
+
+    S = (X * resid[:, None]).T @ (X * resid[:, None])
+    for lag in range(1, L + 1):
+        w = 1.0 - lag / (L + 1)
+        gamma = (X[lag:] * resid[lag:, None]).T @ (X[:-lag] * resid[:-lag, None])
+        S += w * (gamma + gamma.T)
+    var_hac = XtX_inv @ S @ XtX_inv
+    se_hac = np.sqrt(np.diag(var_hac))
+
+    tss = ((y - y.mean()) ** 2).sum()
+    rss = (resid ** 2).sum()
+    r2 = 1 - rss / tss
+    r2_adj = 1 - (1 - r2) * (n - 1) / (n - k)
+    f_stat = (r2 / (k - 1)) / ((1 - r2) / (n - k))
+    f_pval = 1 - stats.f.cdf(f_stat, k - 1, n - k)
+    return dict(beta=beta, se=se_hac, resid=resid, fitted=X @ beta,
+                r2=r2, r2_adj=r2_adj, f=f_stat, f_p=f_pval, dof=n - k, n=n)
+
+
+def t_ci(b, se, dof, alpha=0.05):
+    t = b / se
+    p = 2 * (1 - stats.t.cdf(np.abs(t), dof))
+    c = stats.t.ppf(1 - alpha / 2, dof)
+    return t, p, b - c * se, b + c * se
+
+
+def adf_test(x, max_lag=12):
+    x = np.asarray(x, float)
+    dx = np.diff(x)
+    best_aic, best = np.inf, None
+    for p in range(max_lag + 1):
+        n = len(dx) - p
+        if n < 10:
+            continue
+        Y = dx[p:]
+        cols = [np.ones(n), x[p:-1]]
+        for j in range(1, p + 1):
+            cols.append(dx[p - j:p - j + n])
+        Xm = np.column_stack(cols)
+        beta = np.linalg.lstsq(Xm, Y, rcond=None)[0]
+        res = Y - Xm @ beta
+        sigma2 = (res @ res) / n
+        aic = n * np.log(sigma2) + 2 * Xm.shape[1]
+        if aic < best_aic:
+            se_gamma = np.sqrt(sigma2 * np.linalg.inv(Xm.T @ Xm)[1, 1])
+            best_aic = aic
+            best = (beta[1] / se_gamma, p)
+    stat = best[0]
+    if stat < -3.75: pv = 0.005
+    elif stat < -3.43: pv = 0.01
+    elif stat < -3.12: pv = 0.025
+    elif stat < -2.86: pv = 0.05
+    elif stat < -2.57: pv = 0.10
+    else: pv = 0.20
+    return stat, pv, best[1]
+
+
+def kpss_test(x):
+    x = np.asarray(x, float)
+    n = len(x)
+    e = x - x.mean()
+    S = np.cumsum(e)
+    L = int(4 * (n / 100) ** 0.25)
+    s2 = (e @ e) / n
+    for l in range(1, L + 1):
+        w = 1 - l / (L + 1)
+        s2 += 2 * w * np.sum(e[l:] * e[:-l]) / n
+    stat = np.sum(S ** 2) / (n ** 2 * s2)
+    if stat > 0.739: pv = 0.01
+    elif stat > 0.463: pv = 0.025
+    elif stat > 0.347: pv = 0.05
+    else: pv = 0.10
+    return stat, pv
+
+
+def jarque_bera(resid):
+    n = len(resid)
+    s = stats.skew(resid)
+    k = stats.kurtosis(resid) + 3
+    jb = n / 6 * (s ** 2 + (k - 3) ** 2 / 4)
+    p = 1 - stats.chi2.cdf(jb, 2)
+    return jb, p, s, k
+
+
+def breusch_pagan(resid, X):
+    u2 = resid ** 2
+    Xm = np.asarray(X)
+    b = np.linalg.lstsq(Xm, u2, rcond=None)[0]
+    fit_ = Xm @ b
+    r2 = 1 - ((u2 - fit_) ** 2).sum() / ((u2 - u2.mean()) ** 2).sum()
+    lm = len(resid) * r2
+    return lm, 1 - stats.chi2.cdf(lm, Xm.shape[1] - 1)
+
+
+def white_test(resid, X):
+    u2 = resid ** 2
+    Xm = np.asarray(X)[:, 1:]
+    n = len(resid)
+    cols = [np.ones(n)]
+    for i in range(Xm.shape[1]):
+        cols += [Xm[:, i], Xm[:, i] ** 2]
+    for i in range(Xm.shape[1]):
+        for j in range(i + 1, Xm.shape[1]):
+            cols.append(Xm[:, i] * Xm[:, j])
+    W = np.column_stack(cols)
+    b = np.linalg.lstsq(W, u2, rcond=None)[0]
+    fit_ = W @ b
+    r2 = 1 - ((u2 - fit_) ** 2).sum() / ((u2 - u2.mean()) ** 2).sum()
+    lm = n * r2
+    return lm, 1 - stats.chi2.cdf(lm, W.shape[1] - 1)
+
+
+def durbin_watson(resid):
+    d = np.diff(resid)
+    return (d @ d) / (resid @ resid)
+
+
+def breusch_godfrey(resid, X, nlags=4):
+    n = len(resid)
+    Xm = np.asarray(X)
+    lagged = np.zeros((n, nlags))
+    for l in range(1, nlags + 1):
+        lagged[l:, l - 1] = resid[:-l]
+    Z = np.column_stack([Xm, lagged])
+    b = np.linalg.lstsq(Z, resid, rcond=None)[0]
+    fit_ = Z @ b
+    r2 = 1 - ((resid - fit_) ** 2).sum() / ((resid - resid.mean()) ** 2).sum()
+    lm = n * r2
+    return lm, 1 - stats.chi2.cdf(lm, nlags)
+
+
+def vif(X_df):
+    out = []
+    arr = X_df.values
+    for i in range(arr.shape[1]):
+        y_i = arr[:, i]
+        X_i = np.column_stack([np.ones(len(y_i)), np.delete(arr, i, axis=1)])
+        b = np.linalg.lstsq(X_i, y_i, rcond=None)[0]
+        y_h = X_i @ b
+        r2 = 1 - ((y_i - y_h) ** 2).sum() / ((y_i - y_i.mean()) ** 2).sum()
+        out.append(1 / (1 - r2) if r2 < 0.999 else np.inf)
+    return pd.Series(out, index=X_df.columns)
+
+
+# Loading data
+
+# In[214]:
+
+
+df = df_clean[['USD/EUR', 'FFR', 'ECB DR', 'CPI USA', 'HICP EURO']].copy()
+df['Interest Diff']  = df['FFR']     - df['ECB DR']
+df['Inflation Diff'] = df['CPI USA'] - df['HICP EURO']
+
+features = ['Interest Diff', 'Inflation Diff']
+target = 'USD/EUR'
+X_full = np.column_stack([np.ones(len(df)), df[features].values])
+y_full = df[target].values
+
+print(f"N = {len(df)}, features = {features}, target = {target}")
+print(f"Date range: {df.index.min().date()} → {df.index.max().date()}")
+
+
+# Pre-model diagnostics: stationarity and multicollinearity
+
+# In[215]:
+
+
+adf_stat, adf_p, adf_lag = adf_test(y_full)
+kpss_stat, kpss_p = kpss_test(y_full)
+print(f"ADF : stat = {adf_stat:.3f}, p ≈ {adf_p:.3f} → "
+      f"{'stationary' if adf_p<0.05 else 'non-stationary'}")
+print(f"KPSS: stat = {kpss_stat:.3f}, p ≈ {kpss_p:.3f} → "
+      f"{'non-stationary' if kpss_p<0.05 else 'stationary'}")
+
+print("\nVIF:")
+print(vif(df[features]).round(3).to_string())
+
+
+# OLS estimation using HAC standard errors 
+
+# In[216]:
+
+
+fit = ols_fit(X_full, y_full, L=4)
+names = ['const'] + features
+print(f"N = {fit['n']}, R² = {fit['r2']:.4f}, Adj R² = {fit['r2_adj']:.4f}")
+print(f"F({len(features)}, {fit['dof']}) = {fit['f']:.2f}, p = {fit['f_p']:.2e}\n")
+rows = []
+print(f"{'Variable':<18}{'Coef':>10}{'HAC SE':>10}{'t':>9}{'p':>10}{'95% CI':>22}")
+print("-" * 79)
+for i, nm in enumerate(names):
+    t, p, lo, hi = t_ci(fit['beta'][i], fit['se'][i], fit['dof'])
+    print(f"{nm:<18}{fit['beta'][i]:>+10.4f}{fit['se'][i]:>10.4f}"
+          f"{t:>9.3f}{p:>10.4f}  [{lo:>+.4f}, {hi:>+.4f}]")
+    rows.append(dict(variable=nm, coef=fit['beta'][i], hac_se=fit['se'][i],
+                     t=t, p=p, ci_lo=lo, ci_hi=hi))
+pd.DataFrame(rows).to_csv('ols_coefficients.csv', index=False)
+
+
+# Residual diagnostics
+
+# In[217]:
+
+
+res = fit['resid']
+jb, jb_p, sk, ku = jarque_bera(res)
+print(f"Jarque-Bera     : stat = {jb:.2f}, p = {jb_p:.4f} "
+      f"(skew = {sk:.3f}, kurt = {ku:.3f})")
+bp, bp_p = breusch_pagan(res, X_full)
+print(f"Breusch-Pagan   : LM   = {bp:.2f}, p = {bp_p:.4f}")
+w, w_p = white_test(res, X_full)
+print(f"White           : LM   = {w:.2f}, p = {w_p:.4f}")
+dw = durbin_watson(res)
+print(f"Durbin-Watson   : {dw:.3f}")
+bg, bg_p = breusch_godfrey(res, X_full, nlags=4)
+print(f"Breusch-Godfrey : LM   = {bg:.2f}, p = {bg_p:.4f} (lag = 4)")
+
+
+# Hypothesis testing
+
+# In[218]:
+
+
+print("H₀: βᵢ = 0       H₁: βᵢ ≠ 0       α = 0.05\n")
+for i, nm in enumerate(names[1:], 1):
+    t, p, lo, hi = t_ci(fit['beta'][i], fit['se'][i], fit['dof'])
+    decision = "REJECT H₀" if p < 0.05 else "fail to reject H₀"
+    print(f"  {nm}: β = {fit['beta'][i]:+.4f}, HAC SE = {fit['se'][i]:.4f}, "
+          f"t = {t:.2f}, p = {p:.4f}, 95% CI = [{lo:+.4f}, {hi:+.4f}]  → {decision}")
+print(f"\nJoint F-test: F = {fit['f']:.2f}, p = {fit['f_p']:.2e}")
+
+
+# Cross-validation and benchmark comparison
+
+# In[219]:
+
+
+def run_metrics(y_true, y_pred):
+    return (mean_absolute_error(y_true, y_pred),
+            np.sqrt(mean_squared_error(y_true, y_pred)),
+            np.mean(np.abs((y_true - y_pred) / y_true)) * 100,
+            r2_score(y_true, y_pred))
+
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+scaler = StandardScaler(); X_sc = scaler.fit_transform(df[features])
+bench = {k: [] for k in ['Baseline (mean)', 'OLS',
+                          'Ridge alpha=0.01', 'Ridge alpha=1.0', 'Ridge alpha=10']}
+for tr, te in kf.split(X_full):
+    y_tr, y_te = y_full[tr], y_full[te]
+    bench['Baseline (mean)'].append(
+        mean_absolute_error(y_te, np.full_like(y_te, y_tr.mean())))
+    b = np.linalg.lstsq(X_full[tr], y_tr, rcond=None)[0]
+    bench['OLS'].append(mean_absolute_error(y_te, X_full[te] @ b))
+    for a, key in [(0.01, 'Ridge alpha=0.01'), (1.0, 'Ridge alpha=1.0'),
+                   (10.0, 'Ridge alpha=10')]:
+        m = Ridge(alpha=a).fit(X_sc[tr], y_tr)
+        bench[key].append(mean_absolute_error(y_te, m.predict(X_sc[te])))
+bench_df = pd.DataFrame({k: [np.mean(v), np.std(v)] for k, v in bench.items()},
+                       index=['mean_MAE', 'std_MAE']).T.round(5)
+print("\n5-fold shuffled CV — MAE:")
+print(bench_df.to_string())
+bench_df.to_csv('benchmark_comparison.csv')
+
+tscv = TimeSeriesSplit(n_splits=5)
+metrics_tscv = []
+for tr, te in tscv.split(X_full):
+    b = np.linalg.lstsq(X_full[tr], y_full[tr], rcond=None)[0]
+    yh = X_full[te] @ b
+    metrics_tscv.append(run_metrics(y_full[te], yh))
+m_arr = np.array(metrics_tscv)
+print(f"\nWalk-forward CV (5 splits):")
+print(f"  MAE  = {m_arr[:,0].mean():.5f} (±{m_arr[:,0].std():.5f})")
+print(f"  RMSE = {m_arr[:,1].mean():.5f} (±{m_arr[:,1].std():.5f})")
+print(f"  MAPE = {m_arr[:,2].mean():.3f}% (±{m_arr[:,2].std():.3f}%)")
+print(f"  R²   = {m_arr[:,3].mean():.4f} (±{m_arr[:,3].std():.4f})")
+
+
+# Diagnostic plots
+
+# In[220]:
+
+
+fig, ax = plt.subplots(2, 2, figsize=(12, 9))
+ax[0, 0].scatter(fit['fitted'], res, s=8, alpha=0.3, color='#0052ff')
+ax[0, 0].axhline(0, color='red', lw=1)
+ax[0, 0].set(xlabel='Fitted values', ylabel='Residuals',
+             title='(a) Residuals vs Fitted')
+osm, osr = stats.probplot(res, dist='norm', fit=False)
+ax[0, 1].scatter(osm, osr, s=8, alpha=0.4, color='#9d00ff')
+slope, intercept = stats.linregress(osm, osr)[:2]
+ax[0, 1].plot(osm, slope * osm + intercept, 'r-', lw=1)
+ax[0, 1].set(xlabel='Theoretical quantiles', ylabel='Sample quantiles',
+             title='(b) Q-Q plot of residuals')
+ax[1, 0].hist(res, bins=50, color='#9d00ff', alpha=0.75, edgecolor='white')
+ax[1, 0].set(title='(c) Histogram of residuals', xlabel='Residual')
+df_mo = df[[target]].resample('ME').mean()
+yh_mo = pd.Series(fit['fitted'], index=df.index).resample('ME').mean()
+ax[1, 1].plot(df_mo.index, df_mo[target], 'k-', lw=1.3, label='Actual')
+ax[1, 1].plot(yh_mo.index, yh_mo.values, color='#0052ff', lw=1.3, label='OLS fitted')
+ax[1, 1].set(title='(d) Actual vs Fitted — EUR/USD (monthly)',
+             ylabel='USD per 1 EUR'); ax[1, 1].legend()
+ax[1, 1].tick_params(axis='x', rotation=30)
+plt.tight_layout()
+plt.savefig('figures/diagnostic_plots.png', dpi=200, bbox_inches='tight')
+plt.show()
+
+
+# Coefficient plot with 95% confidence intervals
+
+# In[221]:
+
+
+coefs_df = pd.DataFrame(rows).set_index('variable').drop('const')
+fig, a = plt.subplots(figsize=(8, 3.8))
+errs = (coefs_df['coef'] - coefs_df['ci_lo']).values
+a.errorbar(coefs_df['coef'], coefs_df.index, xerr=errs, fmt='o',
+           color='#0052ff', ecolor='#9d00ff', capsize=6, markersize=10, lw=2)
+a.axvline(0, color='red', lw=1.1, alpha=0.7)
+a.set(xlabel='Coefficient estimate (95% CI, HAC)',
+      title='OLS coefficients — EUR/USD model')
+plt.tight_layout()
+plt.savefig('figures/coefficients_ci.png', dpi=200, bbox_inches='tight')
+plt.show()
+
+
+
+# Benchmark comparison chart
+
+# In[222]:
+
+
+fig, a = plt.subplots(figsize=(9, 4))
+bench_df['mean_MAE'].plot(kind='bar', ax=a, yerr=bench_df['std_MAE'],
+                          color=['#cccccc', '#0052ff', '#9d00ff',
+                                 '#7a00ff', '#4d00aa'],
+                          edgecolor='white', capsize=5)
+a.set(ylabel='MAE (5-fold shuffled CV)',
+      title='Benchmark comparison — lower is better')
+a.tick_params(axis='x', rotation=15)
+plt.tight_layout()
+plt.savefig('figures/benchmark_mae.png', dpi=200, bbox_inches='tight')
+plt.show()
+
+
+# Correlation heatmap
+# 
+
+# In[223]:
+
+
+fig, a = plt.subplots(figsize=(5.5, 4.5))
+cm = df[[target] + features].corr()
+sns.heatmap(cm, annot=True, fmt='.3f', cmap='Blues', ax=a,
+            cbar_kws={'label': 'Pearson ρ'})
+a.set_title('Correlation matrix — EUR/USD and predictors')
+plt.tight_layout()
+plt.savefig('figures/correlation_heatmap.png', dpi=200, bbox_inches='tight')
+plt.show()
+
+
+# ### Lasso and Random Forest
+
+# Data
+
+# In[224]:
+
+
+df = df_clean[['USD/EUR', 'FFR', 'ECB DR', 'CPI USA', 'HICP EURO']].copy()
+df['Interest Diff']  = df['FFR']     - df['ECB DR']
+df['Inflation Diff'] = df['CPI USA'] - df['HICP EURO']
+
+features = ['Interest Diff', 'Inflation Diff']
+target = 'USD/EUR'
+X = df[features].values
+y = df[target].values
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+scaler = StandardScaler().fit(X_train)
+X_train_s = scaler.transform(X_train)
+X_test_s = scaler.transform(X_test)
+print(f"Train: {len(X_train)}   Test: {len(X_test)}   Features: {features}")
+
+
+# Lasso Regression
+
+# In[225]:
+
+
+lasso = LassoCV(cv=5, random_state=42, max_iter=10000).fit(X_train_s, y_train)
+lasso_pred = lasso.predict(X_test_s)
+
+print(f"Optimal alpha: {lasso.alpha_:.5f}\n")
+print(f"{'Variable':<16}{'Coefficient':>14}")
+print("-" * 30)
+for name, coef in zip(features, lasso.coef_):
+    status = "  (dropped)" if abs(coef) < 1e-6 else ""
+    print(f"{name:<16}{coef:>+14.4f}{status}")
+print(f"\nR2:   {r2_score(y_test, lasso_pred):.4f}")
+print(f"RMSE: {mean_squared_error(y_test, lasso_pred) ** 0.5:.4f}")
+print(f"MAE:  {mean_absolute_error(y_test, lasso_pred):.4f}")
+
+
+# Lasso Coefficients
+
+# In[226]:
+
+
+plt.figure(figsize=(7, 4))
+colors = ["#d785da", "#8675db"]
+plt.bar(features, lasso.coef_, color=colors)
+plt.axhline(0, color='grey', lw=1)
+plt.title('Lasso coefficients (standardised features)')
+plt.ylabel('Coefficient')
+plt.tight_layout()
+plt.savefig('figures/lasso_coefficients.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# Random Forest Regression
+
+# In[227]:
+
+
+rf = RandomForestRegressor(n_estimators=300, random_state=42)
+rf.fit(X_train, y_train)
+rf_pred = rf.predict(X_test)
+
+print(f"R2:   {r2_score(y_test, rf_pred):.4f}")
+print(f"RMSE: {mean_squared_error(y_test, rf_pred) ** 0.5:.4f}")
+print(f"MAE:  {mean_absolute_error(y_test, rf_pred):.4f}")
+
+
+# Random Forest Feature Importance
+
+# In[228]:
+
+
+importance = pd.Series(rf.feature_importances_, index=features).sort_values()
+
+print(f"{'Variable':<16}{'Importance':>12}")
+print("-" * 28)
+for name, imp in importance.items():
+    print(f"{name:<16}{imp:>12.4f}")
+
+plt.figure(figsize=(7, 4))
+plt.barh(importance.index, importance.values, color="#86d2c5")
+plt.title('Random Forest feature importance')
+plt.xlabel('Importance')
+plt.tight_layout()
+plt.savefig('figures/rf_feature_importance.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+
+# Model Comparison
+
+# In[229]:
+
+
+comparison = pd.DataFrame({
+    'Lasso': {
+        'R2': round(r2_score(y_test, lasso_pred), 4),
+        'RMSE': round(mean_squared_error(y_test, lasso_pred) ** 0.5, 4),
+        'MAE': round(mean_absolute_error(y_test, lasso_pred), 4),
+        'Captures non-linearity': 'No',
+        'Main result': 'Variable selection / shrinkage',
+    },
+    'Random Forest': {
+        'R2': round(r2_score(y_test, rf_pred), 4),
+        'RMSE': round(mean_squared_error(y_test, rf_pred) ** 0.5, 4),
+        'MAE': round(mean_absolute_error(y_test, rf_pred), 4),
+        'Captures non-linearity': 'Yes',
+        'Main result': 'Feature importance',
+    },
+})
+print(comparison.to_string())
+
+
+# OLS prediction
+
+# In[230]:
+
+
+ols_sk = LinearRegression().fit(X_train, y_train)
+ols_pred = ols_sk.predict(X_test)
+
+models = ['OLS', 'Lasso', 'Random Forest']
+r2_vals = [r2_score(y_test, ols_pred),
+           r2_score(y_test, lasso_pred),
+           r2_score(y_test, rf_pred)]
+mae_vals = [mean_absolute_error(y_test, ols_pred),
+            mean_absolute_error(y_test, lasso_pred),
+            mean_absolute_error(y_test, rf_pred)]
+
+fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 4))
+colors = ["#d785da", "#86d2c5", "#8675db"]
+
+b1 = a1.bar(models, r2_vals, color=colors)
+a1.set_title('Test $R^2$ (higher is better)')
+a1.set_ylim(0, 1)
+for b, v in zip(b1, r2_vals):
+    a1.text(b.get_x() + b.get_width()/2,
+            v + 0.02, f'{v:.3f}', ha='center', fontsize=10)
+
+b2 = a2.bar(models, mae_vals, color=colors)
+a2.set_title('Test MAE (lower is better)')
+for b, v in zip(b2, mae_vals):
+    a2.text(b.get_x() + b.get_width()/2,
+            v + 0.0005, f'{v:.4f}', ha='center', fontsize=10)
+
+for a in (a1, a2):
+    a.spines[['top', 'right']].set_visible(False)
+plt.tight_layout()
+plt.savefig('figures/ModelComparisonMl.png', dpi=200, bbox_inches='tight')
+plt.show()
+
+
+# RF Actual vs Predicted
+
+# In[231]:
+
+
+fig, ax = plt.subplots(figsize=(5.5, 5.5))
+ax.scatter(y_test, rf_pred, s=10, alpha=0.4, color="#0c205a")
+lims = [min(y_test.min(), rf_pred.min()),
+        max(y_test.max(), rf_pred.max())]
+ax.plot(lims, lims, color="#c9430a", lw=1.5, ls='--', label='Perfect fit')
+ax.set_xlabel('Actual EUR/USD')
+ax.set_ylabel('Predicted EUR/USD')
+ax.set_title('Random Forest: actual vs predicted')
+ax.legend()
+ax.spines[['top', 'right']].set_visible(False)
+plt.tight_layout()
+plt.savefig('figures/RfActualVsPredicted.png', dpi=200, bbox_inches='tight')
+plt.show()
+
